@@ -117,10 +117,10 @@ BASE_URLS = [
 # Required headers for Antigravity API calls
 # These headers are CRITICAL for gemini-3-pro-high/low to work
 # Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
-ANTIGRAVITY_USER_AGENT = "antigravity/1.15.8 windows/amd64"
+ANTIGRAVITY_USER_AGENT = "antigravity/1.20.3 windows/amd64"
 ANTIGRAVITY_USER_AGENT_LEGACY = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Antigravity/1.104.0 Chrome/138.0.7204.235 "
+    "(KHTML, like Gecko) Antigravity/1.105.0 Chrome/138.0.7204.235 "
     "Electron/37.3.1 Safari/537.36"
 )
 ANTIGRAVITY_HEADERS = {
