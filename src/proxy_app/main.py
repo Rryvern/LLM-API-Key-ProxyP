@@ -119,6 +119,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     import colorlog
     import hashlib
     import json
+    import random as _random
     from typing import AsyncGenerator, Any, List, Optional, Union
     from pydantic import BaseModel, ConfigDict, Field
 
@@ -374,6 +375,14 @@ PROXY_CACHE_TTL = int(os.getenv("PROXY_CACHE_TTL", "300"))  # 5 minutes default
 PROXY_CACHE_MAX_ENTRIES = int(os.getenv("PROXY_CACHE_MAX_ENTRIES", "50"))
 _cache_models_raw = os.getenv("PROXY_CACHE_MODELS", "")
 PROXY_CACHE_MODELS = [m.strip().lower() for m in _cache_models_raw.split(",") if m.strip()] if _cache_models_raw else []
+
+# --- Context Compression Configuration ---
+# When enabled, long Claude conversations are auto-compressed using Gemini Flash.
+# Older messages get summarized to keep context fresh and improve output quality.
+CONTEXT_COMPRESS_ENABLED = os.getenv("CONTEXT_COMPRESS_ENABLED", "false").lower() in ("true", "1", "yes")
+CONTEXT_COMPRESS_THRESHOLD = int(os.getenv("CONTEXT_COMPRESS_THRESHOLD", "40000"))  # tokens
+CONTEXT_COMPRESS_RECENT_MSGS = int(os.getenv("CONTEXT_COMPRESS_RECENT_MSGS", "10"))
+CONTEXT_COMPRESS_MODEL = os.getenv("CONTEXT_COMPRESS_MODEL", "antigravity/gemini-3-flash")
 
 # Discover API keys from environment variables
 api_keys = {}
@@ -897,6 +906,189 @@ async def streaming_response_wrapper(
             )
 
 
+# --- Context Compressor ---
+class ContextCompressor:
+    """Compresses long conversation contexts using a summarization model.
+
+    When a Claude request exceeds the token threshold, older messages are
+    batch-summarized via Gemini Flash to keep the context fresh and reduce
+    quality degradation in long roleplay sessions.
+    """
+
+    SUMMARIZE_PROMPT = """You are a story summarizer. Summarize the following roleplay/conversation messages into a concise narrative summary.
+
+Preserve these details:
+- Character names, personalities, and relationships
+- Key plot events and story progression (in chronological order)
+- Current scene, location, and situation
+- Important world-building rules and established facts
+- Emotional tone and narrative themes
+
+Do NOT:
+- Add your own commentary or opinions
+- Skip any important plot points
+- Change character names or details
+
+Write the summary as a continuous narrative, not a bullet list. Keep it detailed but concise.
+
+Messages to summarize:"""
+
+    @staticmethod
+    def estimate_tokens(messages: list) -> int:
+        """Rough token estimate: ~4 chars per token."""
+        total_chars = sum(
+            len(str(m.get("content", ""))) + len(str(m.get("role", "")))
+            for m in messages
+        )
+        return total_chars // 4
+
+    @staticmethod
+    def should_compress(model: str, messages: list) -> bool:
+        """Check if this request should be compressed."""
+        if not CONTEXT_COMPRESS_ENABLED:
+            return False
+        if not model or "claude" not in model.lower():
+            return False
+        token_est = ContextCompressor.estimate_tokens(messages)
+        return token_est > CONTEXT_COMPRESS_THRESHOLD
+
+    @staticmethod
+    def split_messages(messages: list, recent_count: int):
+        """Split messages into system prompt, old messages, and recent messages."""
+        system_msgs = []
+        conversation_msgs = []
+
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_msgs.append(msg)
+            else:
+                conversation_msgs.append(msg)
+
+        if len(conversation_msgs) <= recent_count:
+            # Not enough messages to split — skip compression
+            return system_msgs, [], conversation_msgs
+
+        old_msgs = conversation_msgs[:-recent_count]
+        recent_msgs = conversation_msgs[-recent_count:]
+        return system_msgs, old_msgs, recent_msgs
+
+    @staticmethod
+    async def compress(client, model: str, messages: list) -> list:
+        """Compress messages by summarizing older ones with Gemini Flash.
+
+        Returns compressed message list, or original messages if compression fails.
+        """
+        try:
+            system_msgs, old_msgs, recent_msgs = ContextCompressor.split_messages(
+                messages, CONTEXT_COMPRESS_RECENT_MSGS
+            )
+
+            if not old_msgs:
+                logging.info("[Compress] Not enough old messages to compress, skipping.")
+                return messages
+
+            old_tokens = ContextCompressor.estimate_tokens(old_msgs)
+            total_tokens = ContextCompressor.estimate_tokens(messages)
+
+            logging.info(
+                f"[Compress] Compressing {len(old_msgs)} old messages "
+                f"(~{old_tokens} tokens) for {model}"
+            )
+
+            # Format old messages as text for summarization
+            formatted_msgs = []
+            for msg in old_msgs:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                # Handle content that might be a list (multimodal)
+                if isinstance(content, list):
+                    text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+                    content = "\n".join(text_parts)
+                formatted_msgs.append(f"[{role}]: {content}")
+
+            conversation_text = "\n\n".join(formatted_msgs)
+
+            # Call Gemini Flash for summarization (non-streaming)
+            summary_request = {
+                "model": CONTEXT_COMPRESS_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"{ContextCompressor.SUMMARIZE_PROMPT}\n\n{conversation_text}",
+                    }
+                ],
+                "stream": False,
+                "temperature": 0.3,  # Low temp for faithful summarization
+                "max_tokens": 4096,
+            }
+
+            logging.info(f"[Compress] Sending to {CONTEXT_COMPRESS_MODEL} for summarization...")
+            summary_response = await client.acompletion(**summary_request)
+
+            # Extract summary text from response
+            summary_text = ""
+            if hasattr(summary_response, "choices"):
+                summary_text = summary_response.choices[0].message.content
+            elif isinstance(summary_response, dict):
+                choices = summary_response.get("choices", [])
+                if choices:
+                    summary_text = choices[0].get("message", {}).get("content", "")
+
+            if not summary_text:
+                logging.warning("[Compress] Empty summary returned, using original messages.")
+                return messages
+
+            summary_tokens = len(summary_text) // 4
+            logging.info(
+                f"[Compress] Summary generated: ~{summary_tokens} tokens "
+                f"(compressed {old_tokens}→{summary_tokens}, "
+                f"{round((1 - summary_tokens / max(old_tokens, 1)) * 100)}% reduction)"
+            )
+
+            # Random delay for safety (0.5-2 seconds)
+            delay = _random.uniform(0.5, 2.0)
+            logging.debug(f"[Compress] Safety delay: {delay:.1f}s")
+            await asyncio.sleep(delay)
+
+            # Reconstruct compressed message list
+            compressed_messages = []
+
+            # Keep system messages
+            compressed_messages.extend(system_msgs)
+
+            # Add summary as a system message with clear framing
+            compressed_messages.append({
+                "role": "system",
+                "content": (
+                    "[Story Summary - Previous Events]\n"
+                    f"{summary_text}\n"
+                    "[End of Summary - Recent conversation follows]"
+                ),
+            })
+
+            # Keep recent messages intact
+            compressed_messages.extend(recent_msgs)
+
+            new_tokens = ContextCompressor.estimate_tokens(compressed_messages)
+            logging.info(
+                f"[Compress] Context compressed: {total_tokens}→{new_tokens} tokens "
+                f"({len(messages)}→{len(compressed_messages)} messages)"
+            )
+
+            return compressed_messages
+
+        except Exception as e:
+            logging.warning(f"[Compress] Compression failed, using original messages: {e}")
+            return messages  # Graceful fallback
+
+
+if CONTEXT_COMPRESS_ENABLED:
+    logging.info(
+        f"Context compression enabled: threshold={CONTEXT_COMPRESS_THRESHOLD} tokens, "
+        f"recent_msgs={CONTEXT_COMPRESS_RECENT_MSGS}, model={CONTEXT_COMPRESS_MODEL}"
+    )
+
+
 # --- Response Cache ---
 class ResponseCache:
     """In-memory LRU cache with TTL for LLM responses."""
@@ -1077,6 +1269,17 @@ async def chat_completions(
                         content=cached,
                         headers={"X-Cache": "HIT", "X-Cache-Key": cache_key},
                     )
+
+        # --- Context Compression for Claude ---
+        if ContextCompressor.should_compress(model or "", request_data.get("messages", [])):
+            original_count = ContextCompressor.estimate_tokens(request_data.get("messages", []))
+            logging.info(
+                f"[Compress] Long context detected (~{original_count} tokens), "
+                f"compressing for {model}..."
+            )
+            request_data["messages"] = await ContextCompressor.compress(
+                client, model or "", request_data.get("messages", [])
+            )
 
         if is_streaming:
             response_generator = await client.acompletion(
