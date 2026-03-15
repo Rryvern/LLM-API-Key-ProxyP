@@ -976,6 +976,31 @@ Messages to summarize:"""
         return system_msgs, old_msgs, recent_msgs
 
     @staticmethod
+    async def _summarize_chunk(client, messages_text: str, chunk_index: int, total_chunks: int) -> str:
+        """Summarize a single chunk of conversation text via Gemini Flash."""
+        context_note = f"[Part {chunk_index + 1} of {total_chunks}]" if total_chunks > 1 else ""
+        summary_request = {
+            "model": CONTEXT_COMPRESS_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"{ContextCompressor.SUMMARIZE_PROMPT} {context_note}\n\n{messages_text}",
+                }
+            ],
+            "stream": False,
+            "temperature": 0.3,
+            "max_tokens": 8192,
+        }
+        response = await client.acompletion(**summary_request)
+        if hasattr(response, "choices"):
+            return response.choices[0].message.content or ""
+        elif isinstance(response, dict):
+            choices = response.get("choices", [])
+            if choices:
+                return choices[0].get("message", {}).get("content", "")
+        return ""
+
+    @staticmethod
     async def compress(client, model: str, messages: list) -> list:
         """Compress messages by summarizing older ones with Gemini Flash.
 
@@ -1013,46 +1038,63 @@ Messages to summarize:"""
                     f"— saved 1 Gemini request"
                 )
             else:
-                # Format old messages as text for summarization
-                formatted_msgs = []
+                # Split old messages into chunks of ~15k tokens to avoid Gemini context limits
+                CHUNK_TOKEN_LIMIT = 15000
+                chunks = []
+                current_chunk = []
+                current_chunk_tokens = 0
                 for msg in old_msgs:
-                    role = msg.get("role", "unknown")
-                    content = msg.get("content", "")
-                    # Handle content that might be a list (multimodal)
-                    if isinstance(content, list):
-                        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
-                        content = "\n".join(text_parts)
-                    formatted_msgs.append(f"[{role}]: {content}")
+                    msg_tokens = ContextCompressor.estimate_tokens([msg])
+                    if current_chunk and current_chunk_tokens + msg_tokens > CHUNK_TOKEN_LIMIT:
+                        chunks.append(current_chunk)
+                        current_chunk = []
+                        current_chunk_tokens = 0
+                    current_chunk.append(msg)
+                    current_chunk_tokens += msg_tokens
+                if current_chunk:
+                    chunks.append(current_chunk)
 
-                conversation_text = "\n\n".join(formatted_msgs)
+                logging.info(f"[Compress] Split into {len(chunks)} chunk(s) for summarization")
 
-                summary_request = {
-                    "model": CONTEXT_COMPRESS_MODEL,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": f"{ContextCompressor.SUMMARIZE_PROMPT}\n\n{conversation_text}",
-                        }
-                    ],
-                    "stream": False,
-                    "temperature": 0.3,  # Low temp for faithful summarization
-                    "max_tokens": 8192,
-                }
+                # Format and summarize each chunk
+                chunk_summaries = []
+                for i, chunk in enumerate(chunks):
+                    formatted_msgs = []
+                    for msg in chunk:
+                        role = msg.get("role", "unknown")
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+                            content = "\n".join(text_parts)
+                        formatted_msgs.append(f"[{role}]: {content}")
+                    chunk_text = "\n\n".join(formatted_msgs)
 
-                logging.info(f"[Compress] Sending to {CONTEXT_COMPRESS_MODEL} for summarization...")
-                summary_response = await client.acompletion(**summary_request)
+                    logging.info(f"[Compress] Summarizing chunk {i+1}/{len(chunks)} (~{ContextCompressor.estimate_tokens(chunk)} tokens)...")
+                    chunk_summary = await ContextCompressor._summarize_chunk(client, chunk_text, i, len(chunks))
+                    if not chunk_summary:
+                        logging.warning(f"[Compress] Empty summary for chunk {i+1}, skipping")
+                    else:
+                        chunk_summaries.append(chunk_summary)
 
-                # Extract summary text from response
-                summary_text = ""
-                if hasattr(summary_response, "choices"):
-                    summary_text = summary_response.choices[0].message.content
-                elif isinstance(summary_response, dict):
-                    choices = summary_response.get("choices", [])
-                    if choices:
-                        summary_text = choices[0].get("message", {}).get("content", "")
+                if not chunk_summaries:
+                    logging.warning("[Compress] All chunk summaries empty, using original messages.")
+                    return messages
+
+                # If multiple chunks, merge summaries with a final pass
+                if len(chunk_summaries) > 1:
+                    logging.info(f"[Compress] Merging {len(chunk_summaries)} chunk summaries into final summary...")
+                    merged_text = "\n\n".join(
+                        f"[Segment {i+1}]:\n{s}" for i, s in enumerate(chunk_summaries)
+                    )
+                    summary_text = await ContextCompressor._summarize_chunk(client, merged_text, 0, 1)
+                    if not summary_text:
+                        # Fall back to just concatenating chunk summaries
+                        summary_text = "\n\n".join(chunk_summaries)
+                else:
+                    summary_text = chunk_summaries[0]
 
                 if not summary_text:
-                    logging.warning("[Compress] Empty summary returned, using original messages.")
+                    logging.warning("[Compress] Empty final summary, using original messages.")
                     return messages
 
                 # Cache the summary for reuse
@@ -1298,6 +1340,7 @@ async def chat_completions(
                     )
 
         # --- Context Compression for Claude ---
+        _was_compressed = False
         if ContextCompressor.should_compress(model or "", request_data.get("messages", [])):
             original_count = ContextCompressor.estimate_tokens(request_data.get("messages", []))
             logging.info(
@@ -1307,6 +1350,13 @@ async def chat_completions(
             request_data["messages"] = await ContextCompressor.compress(
                 client, model or "", request_data.get("messages", [])
             )
+            _was_compressed = True
+
+        # Skip response cache after compression — compressed context changes every request
+        # and we want each Claude call to produce a fresh response (especially for regenerates)
+        if _was_compressed and cache_key is not None:
+            logging.debug("[Cache] Bypassing cache for compressed request (ensures fresh response)")
+            cache_key = None
 
         if is_streaming:
             response_generator = await client.acompletion(
