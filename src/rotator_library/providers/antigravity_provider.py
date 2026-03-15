@@ -210,6 +210,11 @@ _internal_attempt_count: ContextVar[int] = ContextVar(
 # System instruction configuration
 # When true (default), prepend the Antigravity agent system instruction (identity, tool_calling, etc.)
 PREPEND_INSTRUCTION = env_bool("ANTIGRAVITY_PREPEND_INSTRUCTION", True)
+
+# When true, prepend <thinking>...</thinking> block into the content field for
+# clients like SillyTavern that only read content and ignore reasoning_content.
+# Off by default - enable with ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT=true
+EXPOSE_THINKING_IN_CONTENT = env_bool("ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT", False)
 # NOTE: system_instruction is always normalized to systemInstruction (camelCase)
 # per Antigravity API requirements. snake_case system_instruction is not supported.
 # When true, inject an override instruction after the Antigravity prompt that tells the model
@@ -3807,6 +3812,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             delta["content"] = text_content
         if reasoning_content:
             delta["reasoning_content"] = reasoning_content
+            # Optionally expose thinking in content for clients like SillyTavern
+            # that only read content and ignore reasoning_content
+            if EXPOSE_THINKING_IN_CONTENT:
+                think_block = f"<thinking>\n{reasoning_content}\n</thinking>\n"
+                delta["content"] = think_block + delta.get("content", "")
         if tool_calls:
             delta["tool_calls"] = tool_calls
             delta["role"] = "assistant"
@@ -4395,6 +4405,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             message_dict["content"] = collected_content
         if collected_reasoning:
             message_dict["reasoning_content"] = collected_reasoning
+            # Optionally expose thinking in content for clients like SillyTavern
+            if EXPOSE_THINKING_IN_CONTENT:
+                think_block = f"<thinking>\n{collected_reasoning}\n</thinking>\n"
+                message_dict["content"] = think_block + message_dict.get("content", "")
         if collected_tool_calls:
             # Convert to proper format
             message_dict["tool_calls"] = [
