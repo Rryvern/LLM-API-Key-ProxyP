@@ -214,7 +214,7 @@ PREPEND_INSTRUCTION = env_bool("ANTIGRAVITY_PREPEND_INSTRUCTION", True)
 # When true, prepend <thinking>...</thinking> block into the content field for
 # clients like SillyTavern that only read content and ignore reasoning_content.
 # Off by default - enable with ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT=true
-EXPOSE_THINKING_IN_CONTENT = env_bool("ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT", False)
+EXPOSE_THINKING_IN_CONTENT = env_bool("ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT", true)
 # NOTE: system_instruction is always normalized to systemInstruction (camelCase)
 # per Antigravity API requirements. snake_case system_instruction is not supported.
 # When true, inject an override instruction after the Antigravity prompt that tells the model
