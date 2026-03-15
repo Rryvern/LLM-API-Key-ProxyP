@@ -214,7 +214,7 @@ PREPEND_INSTRUCTION = env_bool("ANTIGRAVITY_PREPEND_INSTRUCTION", True)
 # When true, prepend <thinking>...</thinking> block into the content field for
 # clients like SillyTavern that only read content and ignore reasoning_content.
 # Off by default - enable with ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT=true
-EXPOSE_THINKING_IN_CONTENT = env_bool("ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT", true)
+EXPOSE_THINKING_IN_CONTENT = env_bool("ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT", False)
 # NOTE: system_instruction is always normalized to systemInstruction (camelCase)
 # per Antigravity API requirements. snake_case system_instruction is not supported.
 # When true, inject an override instruction after the Antigravity prompt that tells the model
@@ -3704,15 +3704,36 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             func_config["mode"] = "AUTO"
 
         # Handle Gemini 3 thinking logic
-        if not internal_model.startswith("gemini-3-"):
+        if not (internal_model.startswith("gemini-3-") or internal_model.startswith("gemini-3.1-")):
             thinking_config = gen_config.get("thinkingConfig", {})
             if "thinkingLevel" in thinking_config:
                 del thinking_config["thinkingLevel"]
                 thinking_config["thinkingBudget"] = -1
 
+        # Strip include_thoughts from thinkingConfig before sending to API
+        # It is an internal flag used only by this code, not a real API parameter
+        thinking_config = gen_config.get("thinkingConfig", {})
+        thinking_config.pop("include_thoughts", None)
+        if thinking_config:
+            gen_config["thinkingConfig"] = thinking_config
+        elif "thinkingConfig" in gen_config:
+            del gen_config["thinkingConfig"]
+
+        # Log what thinking config will be sent for Claude, to aid debugging
+        if self._is_claude(internal_model) and gen_config.get("thinkingConfig"):
+            lib_logger.info(
+                f"[Antigravity] Claude thinking config being sent: {gen_config['thinkingConfig']}, "
+                f"internal_model={internal_model}"
+            )
+        elif self._is_claude(internal_model):
+            lib_logger.info(
+                f"[Antigravity] Claude request has NO thinkingConfig - thinking will NOT be activated. "
+                f"internal_model={internal_model}"
+            )
+
         # Ensure first function call in each model message has a thoughtSignature for Gemini 3
         # Per Gemini docs: Only the FIRST parallel function call gets a signature
-        if internal_model.startswith("gemini-3-"):
+        if internal_model.startswith("gemini-3-") or internal_model.startswith("gemini-3.1-"):
             for content in antigravity_payload["request"].get("contents", []):
                 if content.get("role") == "model":
                     first_func_seen = False
