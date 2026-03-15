@@ -215,6 +215,10 @@ PREPEND_INSTRUCTION = env_bool("ANTIGRAVITY_PREPEND_INSTRUCTION", True)
 # clients like SillyTavern that only read content and ignore reasoning_content.
 # Off by default - enable with ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT=true
 EXPOSE_THINKING_IN_CONTENT = env_bool("ANTIGRAVITY_EXPOSE_THINKING_IN_CONTENT", False)
+
+# When true, force Claude non-Opus models (like Sonnet) to use their -thinking variant
+# regardless of whether the client sent a reasoning_effort parameter.
+FORCE_CLAUDE_THINKING = env_bool("ANTIGRAVITY_FORCE_CLAUDE_THINKING", False)
 # NOTE: system_instruction is always normalized to systemInstruction (camelCase)
 # per Antigravity API requirements. snake_case system_instruction is not supported.
 # When true, inject an override instruction after the Antigravity prompt that tells the model
@@ -3527,13 +3531,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         # Map Claude models to their -thinking variant
         # claude-opus-4-x: ALWAYS use -thinking (non-thinking variant doesn't exist)
-        # claude-sonnet-4-6: only use -thinking when reasoning_effort is provided
+        # claude-sonnet-4-6: only use -thinking when reasoning_effort is provided (or forced)
         if self._is_claude(internal_model) and not internal_model.endswith("-thinking"):
             if internal_model in ("claude-opus-4-5", "claude-opus-4-6"):
                 # Opus models ALWAYS require -thinking variant
                 internal_model = f"{internal_model}-thinking"
-            elif internal_model == "claude-sonnet-4-6" and reasoning_effort:
-                # Sonnet 4.5 uses -thinking only when reasoning_effort is provided
+            elif internal_model == "claude-sonnet-4-6" and (reasoning_effort or FORCE_CLAUDE_THINKING):
+                # Sonnet 4.5 uses -thinking only when reasoning_effort is provided or explicitly forced
                 internal_model = "claude-sonnet-4-6-thinking"
 
         # Map gemini-2.5-flash to -thinking variant when reasoning_effort is provided
@@ -3710,14 +3714,18 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 del thinking_config["thinkingLevel"]
                 thinking_config["thinkingBudget"] = -1
 
-        # Strip include_thoughts from thinkingConfig before sending to API
-        # It is an internal flag used only by this code, not a real API parameter
-        thinking_config = gen_config.get("thinkingConfig", {})
-        thinking_config.pop("include_thoughts", None)
-        if thinking_config:
-            gen_config["thinkingConfig"] = thinking_config
-        elif "thinkingConfig" in gen_config:
-            del gen_config["thinkingConfig"]
+        # For Claude models: strip include_thoughts from thinkingConfig before sending.
+        # include_thoughts is NOT a real Claude/Antigravity API field, so we remove it
+        # to keep the payload clean.
+        # For Gemini models: include_thoughts IS a real API parameter that tells the
+        # Antigravity backend to return thinking blocks in the response — do NOT strip it.
+        if self._is_claude(internal_model):
+            thinking_config = gen_config.get("thinkingConfig", {})
+            thinking_config.pop("include_thoughts", None)
+            if thinking_config:
+                gen_config["thinkingConfig"] = thinking_config
+            elif "thinkingConfig" in gen_config:
+                del gen_config["thinkingConfig"]
 
         # Log what thinking config will be sent for Claude, to aid debugging
         if self._is_claude(internal_model) and gen_config.get("thinkingConfig"):
