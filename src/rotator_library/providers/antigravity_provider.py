@@ -3530,15 +3530,16 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         internal_model = self._alias_to_internal(model)
 
         # Map Claude models to their -thinking variant
-        # claude-opus-4-x: ALWAYS use -thinking (non-thinking variant doesn't exist)
-        # claude-sonnet-4-6: only use -thinking when reasoning_effort is provided (or forced)
+        # claude-opus-4-x: ALWAYS use -thinking (a real distinct model variant in Antigravity)
+        # claude-sonnet-4-6: NO -thinking variant exists in the Antigravity backend — do NOT
+        #   attempt to swap the model name, it will cause an HTTPStatusError.
+        #   Sonnet thinking (if supported) is controlled via thinkingBudget in generationConfig only.
         if self._is_claude(internal_model) and not internal_model.endswith("-thinking"):
             if internal_model in ("claude-opus-4-5", "claude-opus-4-6"):
                 # Opus models ALWAYS require -thinking variant
                 internal_model = f"{internal_model}-thinking"
-            elif internal_model == "claude-sonnet-4-6" and (reasoning_effort or FORCE_CLAUDE_THINKING):
-                # Sonnet 4.5 uses -thinking only when reasoning_effort is provided or explicitly forced
-                internal_model = "claude-sonnet-4-6-thinking"
+            # NOTE: claude-sonnet-4-6-thinking does not exist as a model in the Antigravity backend.
+            # The FORCE_CLAUDE_THINKING flag therefore has no effect on model selection for Sonnet.
 
         # Map gemini-2.5-flash to -thinking variant when reasoning_effort is provided
         if internal_model == "gemini-2.5-flash" and reasoning_effort:
