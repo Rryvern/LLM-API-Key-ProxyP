@@ -117,6 +117,7 @@ print("  → Loading core dependencies...")
 with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from dotenv import load_dotenv
     import colorlog
+    import hashlib
     import json
     from typing import AsyncGenerator, Any, List, Optional, Union
     from pydantic import BaseModel, ConfigDict, Field
@@ -363,6 +364,16 @@ if ENABLE_RAW_LOGGING:
     logging.info("Raw I/O logging is enabled (proxy boundary, unmodified HTTP data).")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
+
+# --- Response Caching Configuration ---
+# When enabled, caches responses for identical requests to conserve quota.
+# Only caches models listed in PROXY_CACHE_MODELS (comma-separated, e.g. "claude-sonnet-4.6,claude-opus-4.6")
+# If PROXY_CACHE_MODELS is empty/unset and caching is enabled, ALL models are cached.
+PROXY_CACHE_ENABLED = os.getenv("PROXY_CACHE_ENABLED", "false").lower() in ("true", "1", "yes")
+PROXY_CACHE_TTL = int(os.getenv("PROXY_CACHE_TTL", "300"))  # 5 minutes default
+PROXY_CACHE_MAX_ENTRIES = int(os.getenv("PROXY_CACHE_MAX_ENTRIES", "50"))
+_cache_models_raw = os.getenv("PROXY_CACHE_MODELS", "")
+PROXY_CACHE_MODELS = [m.strip().lower() for m in _cache_models_raw.split(",") if m.strip()] if _cache_models_raw else []
 
 # Discover API keys from environment variables
 api_keys = {}
@@ -886,6 +897,68 @@ async def streaming_response_wrapper(
             )
 
 
+# --- Response Cache ---
+class ResponseCache:
+    """In-memory LRU cache with TTL for LLM responses."""
+
+    def __init__(self, max_entries: int = 50, ttl: int = 300):
+        from collections import OrderedDict
+        self._cache: 'OrderedDict[str, dict]' = OrderedDict()
+        self._max_entries = max_entries
+        self._ttl = ttl
+
+    @staticmethod
+    def _make_key(model: str, messages: list) -> str:
+        """Generate a cache key from model + messages content."""
+        # Only hash the semantic content: model name + message roles and content
+        key_data = json.dumps({"model": model, "messages": messages}, sort_keys=True, default=str)
+        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
+    def get(self, key: str):
+        """Get cached response. Returns None if miss or expired."""
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        if time.time() - entry["timestamp"] > self._ttl:
+            # Expired
+            del self._cache[key]
+            return None
+        # Move to end (most recently used)
+        self._cache.move_to_end(key)
+        return entry["response"]
+
+    def put(self, key: str, response: dict):
+        """Store a response in the cache."""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = {"response": response, "timestamp": time.time()}
+        # Evict oldest if over limit
+        while len(self._cache) > self._max_entries:
+            self._cache.popitem(last=False)
+
+    def should_cache_model(self, model: str) -> bool:
+        """Check if this model should be cached based on PROXY_CACHE_MODELS filter."""
+        if not PROXY_CACHE_MODELS:
+            return True  # No filter = cache all
+        model_lower = model.lower()
+        return any(allowed in model_lower for allowed in PROXY_CACHE_MODELS)
+
+    @property
+    def size(self) -> int:
+        return len(self._cache)
+
+
+# Initialize global cache instance
+_response_cache = ResponseCache(
+    max_entries=PROXY_CACHE_MAX_ENTRIES,
+    ttl=PROXY_CACHE_TTL,
+) if PROXY_CACHE_ENABLED else None
+
+if PROXY_CACHE_ENABLED:
+    _cache_filter = f" (models: {', '.join(PROXY_CACHE_MODELS)})" if PROXY_CACHE_MODELS else " (all models)"
+    logging.info(f"Response caching enabled: TTL={PROXY_CACHE_TTL}s, max={PROXY_CACHE_MAX_ENTRIES}{_cache_filter}")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -957,21 +1030,118 @@ async def chat_completions(
         )
         is_streaming = request_data.get("stream", False)
 
+        # --- Response Cache Check ---
+        cache_key = None
+        if _response_cache and _response_cache.should_cache_model(model or ""):
+            cache_key = ResponseCache._make_key(
+                model or "",
+                request_data.get("messages", []),
+            )
+            cached = _response_cache.get(cache_key)
+            if cached is not None:
+                logging.info(f"[Cache] HIT for {model} (key={cache_key})")
+                if is_streaming:
+                    # Replay cached response as SSE stream
+                    async def replay_cached(data):
+                        # Send as a single chunk with the full response
+                        chunk = {
+                            "id": data.get("id", f"cached-{cache_key}"),
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": data.get("model", model),
+                            "choices": [{
+                                "index": 0,
+                                "delta": data.get("choices", [{}])[0].get("message", {}),
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        # Send finish chunk
+                        finish_chunk = {
+                            "id": data.get("id", f"cached-{cache_key}"),
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": data.get("model", model),
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(finish_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                    return StreamingResponse(
+                        replay_cached(cached),
+                        media_type="text/event-stream",
+                        headers={"X-Cache": "HIT", "X-Cache-Key": cache_key},
+                    )
+                else:
+                    return JSONResponse(
+                        content=cached,
+                        headers={"X-Cache": "HIT", "X-Cache-Key": cache_key},
+                    )
+
         if is_streaming:
             response_generator = await client.acompletion(
                 request=request, **request_data
             )
+
+            async def caching_stream_wrapper(
+                req, req_data, stream, logger, c_key
+            ):
+                """Wraps streaming_response_wrapper to capture and cache the full response."""
+                response_chunks = []
+                async for chunk_str in streaming_response_wrapper(req, req_data, stream, logger):
+                    yield chunk_str
+                    # Capture content chunks for caching
+                    if chunk_str.strip() and chunk_str.startswith("data:"):
+                        content = chunk_str[len("data:"):].strip()
+                        if content != "[DONE]":
+                            try:
+                                response_chunks.append(json.loads(content))
+                            except json.JSONDecodeError:
+                                pass
+
+                # After stream completes, build and cache the aggregated response
+                if c_key and response_chunks and _response_cache:
+                    try:
+                        # Build aggregated response from chunks
+                        final_content = ""
+                        final_model = model
+                        final_id = None
+                        for rc in response_chunks:
+                            if not final_id and rc.get("id"):
+                                final_id = rc["id"]
+                            if not final_model and rc.get("model"):
+                                final_model = rc["model"]
+                            for choice in rc.get("choices", []):
+                                delta = choice.get("delta", {})
+                                if delta.get("content"):
+                                    final_content += delta["content"]
+
+                        aggregated = {
+                            "id": final_id or f"cache-{c_key}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": final_model,
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": final_content},
+                                "finish_reason": "stop",
+                            }],
+                        }
+                        _response_cache.put(c_key, aggregated)
+                        logging.info(f"[Cache] STORED response for {model} (key={c_key}, size={_response_cache.size})")
+                    except Exception as e:
+                        logging.warning(f"[Cache] Failed to cache response: {e}")
+
             return StreamingResponse(
-                streaming_response_wrapper(
-                    request, request_data, response_generator, raw_logger
+                caching_stream_wrapper(
+                    request, request_data, response_generator, raw_logger, cache_key
                 ),
                 media_type="text/event-stream",
+                headers={"X-Cache": "MISS", "X-Cache-Key": cache_key or "none"},
             )
         else:
             response = await client.acompletion(request=request, **request_data)
             if raw_logger:
-                # Assuming response has status_code and headers attributes
-                # This might need adjustment based on the actual response object
                 response_headers = (
                     response.headers if hasattr(response, "headers") else None
                 )
@@ -983,6 +1153,13 @@ async def chat_completions(
                     headers=response_headers,
                     body=response.model_dump(),
                 )
+            # Cache non-streaming response
+            if cache_key and _response_cache and hasattr(response, "model_dump"):
+                try:
+                    _response_cache.put(cache_key, response.model_dump())
+                    logging.info(f"[Cache] STORED response for {model} (key={cache_key}, size={_response_cache.size})")
+                except Exception as e:
+                    logging.warning(f"[Cache] Failed to cache response: {e}")
             return response
 
     except (
