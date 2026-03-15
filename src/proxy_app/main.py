@@ -1001,7 +1001,7 @@ Messages to summarize:"""
         return ""
 
     @staticmethod
-    async def compress(client, model: str, messages: list) -> list:
+    async def compress(client, model: str, messages: list, request=None) -> list:
         """Compress messages by summarizing older ones with Gemini Flash.
 
         Returns compressed message list, or original messages if compression fails.
@@ -1059,6 +1059,11 @@ Messages to summarize:"""
                 # Format and summarize each chunk
                 chunk_summaries = []
                 for i, chunk in enumerate(chunks):
+                    # Abort early if the client disconnected (user cancelled in SillyTavern)
+                    if request is not None and await request.is_disconnected():
+                        logging.info("[Compress] Client disconnected — aborting compression early.")
+                        return messages
+
                     formatted_msgs = []
                     for msg in chunk:
                         role = msg.get("role", "unknown")
@@ -1075,6 +1080,11 @@ Messages to summarize:"""
                         logging.warning(f"[Compress] Empty summary for chunk {i+1}, skipping")
                     else:
                         chunk_summaries.append(chunk_summary)
+
+                    # Inter-chunk delay to avoid 429 rate limits on rapid sequential Gemini calls
+                    if i < len(chunks) - 1:
+                        logging.debug("[Compress] Inter-chunk delay: 2s")
+                        await asyncio.sleep(2.0)
 
                 if not chunk_summaries:
                     logging.warning("[Compress] All chunk summaries empty, using original messages.")
@@ -1348,7 +1358,7 @@ async def chat_completions(
                 f"compressing for {model}..."
             )
             request_data["messages"] = await ContextCompressor.compress(
-                client, model or "", request_data.get("messages", [])
+                client, model or "", request_data.get("messages", []), request
             )
             _was_compressed = True
 
