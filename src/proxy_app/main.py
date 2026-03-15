@@ -915,6 +915,9 @@ class ContextCompressor:
     quality degradation in long roleplay sessions.
     """
 
+    # In-memory cache for summaries: {hash_of_old_msgs: summary_text}
+    _summary_cache: dict = {}
+
     SUMMARIZE_PROMPT = """You are a story summarizer. Summarize the following roleplay/conversation messages into a concise narrative summary.
 
 Preserve these details:
@@ -995,48 +998,66 @@ Messages to summarize:"""
                 f"(~{old_tokens} tokens) for {model}"
             )
 
-            # Format old messages as text for summarization
-            formatted_msgs = []
-            for msg in old_msgs:
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                # Handle content that might be a list (multimodal)
-                if isinstance(content, list):
-                    text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
-                    content = "\n".join(text_parts)
-                formatted_msgs.append(f"[{role}]: {content}")
+            # Check summary cache first
+            cache_key_data = json.dumps(
+                [{"role": m.get("role"), "content": str(m.get("content", ""))} for m in old_msgs],
+                sort_keys=True,
+            )
+            cache_hash = hashlib.sha256(cache_key_data.encode()).hexdigest()[:16]
 
-            conversation_text = "\n\n".join(formatted_msgs)
+            if cache_hash in ContextCompressor._summary_cache:
+                summary_text = ContextCompressor._summary_cache[cache_hash]
+                summary_tokens = len(summary_text) // 4
+                logging.info(
+                    f"[Compress] CACHED summary reused (hash={cache_hash}, ~{summary_tokens} tokens) "
+                    f"— saved 1 Gemini request"
+                )
+            else:
+                # Format old messages as text for summarization
+                formatted_msgs = []
+                for msg in old_msgs:
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content", "")
+                    # Handle content that might be a list (multimodal)
+                    if isinstance(content, list):
+                        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+                        content = "\n".join(text_parts)
+                    formatted_msgs.append(f"[{role}]: {content}")
 
-            # Call Gemini Flash for summarization (non-streaming)
-            summary_request = {
-                "model": CONTEXT_COMPRESS_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"{ContextCompressor.SUMMARIZE_PROMPT}\n\n{conversation_text}",
-                    }
-                ],
-                "stream": False,
-                "temperature": 0.3,  # Low temp for faithful summarization
-                "max_tokens": 4096,
-            }
+                conversation_text = "\n\n".join(formatted_msgs)
 
-            logging.info(f"[Compress] Sending to {CONTEXT_COMPRESS_MODEL} for summarization...")
-            summary_response = await client.acompletion(**summary_request)
+                summary_request = {
+                    "model": CONTEXT_COMPRESS_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"{ContextCompressor.SUMMARIZE_PROMPT}\n\n{conversation_text}",
+                        }
+                    ],
+                    "stream": False,
+                    "temperature": 0.3,  # Low temp for faithful summarization
+                    "max_tokens": 8192,
+                }
 
-            # Extract summary text from response
-            summary_text = ""
-            if hasattr(summary_response, "choices"):
-                summary_text = summary_response.choices[0].message.content
-            elif isinstance(summary_response, dict):
-                choices = summary_response.get("choices", [])
-                if choices:
-                    summary_text = choices[0].get("message", {}).get("content", "")
+                logging.info(f"[Compress] Sending to {CONTEXT_COMPRESS_MODEL} for summarization...")
+                summary_response = await client.acompletion(**summary_request)
 
-            if not summary_text:
-                logging.warning("[Compress] Empty summary returned, using original messages.")
-                return messages
+                # Extract summary text from response
+                summary_text = ""
+                if hasattr(summary_response, "choices"):
+                    summary_text = summary_response.choices[0].message.content
+                elif isinstance(summary_response, dict):
+                    choices = summary_response.get("choices", [])
+                    if choices:
+                        summary_text = choices[0].get("message", {}).get("content", "")
+
+                if not summary_text:
+                    logging.warning("[Compress] Empty summary returned, using original messages.")
+                    return messages
+
+                # Cache the summary for reuse
+                ContextCompressor._summary_cache[cache_hash] = summary_text
+                logging.info(f"[Compress] Summary cached (hash={cache_hash})")
 
             summary_tokens = len(summary_text) // 4
             logging.info(
@@ -1044,6 +1065,12 @@ Messages to summarize:"""
                 f"(compressed {old_tokens}→{summary_tokens}, "
                 f"{round((1 - summary_tokens / max(old_tokens, 1)) * 100)}% reduction)"
             )
+
+            # Log the full summary content for debugging
+            logging.info(f"[Compress] === SUMMARY CONTENT START ===")
+            for line in summary_text.split("\n"):
+                logging.info(f"[Compress]   {line}")
+            logging.info(f"[Compress] === SUMMARY CONTENT END ===")
 
             # Random delay for safety (0.5-2 seconds)
             delay = _random.uniform(0.5, 2.0)
